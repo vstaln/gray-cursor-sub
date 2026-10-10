@@ -1,0 +1,20 @@
+[package]
+name = "gray-cursor-sub"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+
+[lib]
+name = "cursor_sub"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cursor-sub"
+path = "src/main.rs"
+
+[dependencies]
+gray-acp-bridge = { path = "../gray-acp-bridge" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
