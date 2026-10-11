@@ -96,7 +96,7 @@ impl Driver for CursorDriver {
         session_id: &str,
         session_new_result: &Value,
         model: &str,
-        _effort: Option<&str>,
+        effort: Option<&str>,
         overrides: &[(String, String)],
     ) -> Result<(), String> {
         if let Err(e) = client.set_model(session_id, model, Value::Null) {
@@ -111,6 +111,13 @@ impl Driver for CursorDriver {
                 continue;
             };
             let _ = client.set_config_option(session_id, &option_id, json!(value));
+        }
+        if let Some(e) = effort {
+            if !overrides.iter().any(|(k, _)| k == "effort") {
+                if let Some(option_id) = find_config_option(session_new_result, "effort") {
+                    let _ = client.set_config_option(session_id, &option_id, json!(e));
+                }
+            }
         }
         Ok(())
     }
