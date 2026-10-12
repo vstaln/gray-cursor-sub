@@ -19,8 +19,7 @@ sidecar only translates between gray's Responses wire and ACP.
 2. Run `/cursor` to check status. It reports the signed-in account and CLI version.
 3. Pick a Cursor model; the catalog is fetched live from `cursor/list_available_models`.
 
-Auth method: `cursor_login` (OAuth kind). Credentials stay with the Cursor CLI; the sidecar
-stores only a login marker and metadata.
+Auth methods: `cursor_login` (OAuth kind): the Cursor CLI holds the login, and the sidecar stores only a marker and account metadata. API key (`CURSOR_API_KEY`): the key is passed to the Cursor CLI, and the sidecar caches the key it was given in its own cache file (mode 0600).
 
 ## Environment
 
