@@ -246,8 +246,8 @@ fn auth_revoke(params: &Value) -> Result<Value, RpcError> {
                 .stderr(Stdio::null())
                 .status();
         }
-    } else if let Ok(home) = std::env::var("HOME") {
-        let _ = std::fs::remove_file(format!("{home}/.cursor-sub.json"));
+    } else if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        let _ = std::fs::remove_file(std::path::Path::new(&home).join(".cursor-sub.json"));
     }
     Ok(json!({}))
 }
