@@ -66,6 +66,7 @@ fn cache_path() -> Option<std::path::PathBuf> {
         .ok()
         .or_else(|| {
             std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
                 .ok()
                 .map(|h| std::path::Path::new(&h).join(".cursor-sub.json"))
         })
@@ -128,25 +129,43 @@ pub fn acp_argv() -> Vec<String> {
 
 /// PATH lookup for an executable name (no new deps).
 fn which_on_path(name: &str) -> Option<String> {
-    let path = std::env::var("PATH").ok()?;
-    for dir in path.split(':') {
-        let candidate = format!("{dir}/{name}");
-        if std::fs::metadata(&candidate)
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-        {
-            // executable bit check
-            #[cfg(unix)]
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for candidate in exe_candidates(&dir, name) {
+            if std::fs::metadata(&candidate)
+                .map(|m| m.is_file())
+                .unwrap_or(false)
             {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(m) = std::fs::metadata(&candidate) {
-                    if m.permissions().mode() & 0o111 == 0 {
-                        continue;
+                // executable bit check
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(m) = std::fs::metadata(&candidate) {
+                        if m.permissions().mode() & 0o111 == 0 {
+                            continue;
+                        }
                     }
                 }
+                return Some(candidate.to_string_lossy().into_owned());
             }
-            return Some(candidate);
         }
     }
     None
+}
+
+/// On unix the bare name; on Windows the name plus each PATHEXT suffix
+/// (cursor-agent may be installed as .exe/.cmd).
+#[cfg(unix)]
+fn exe_candidates(dir: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
+    vec![dir.join(name)]
+}
+
+#[cfg(windows)]
+fn exe_candidates(dir: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
+    let mut v = vec![dir.join(name)];
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    for ext in pathext.split(';').filter(|e| !e.is_empty()) {
+        v.push(dir.join(format!("{name}{ext}")));
+    }
+    v
 }
