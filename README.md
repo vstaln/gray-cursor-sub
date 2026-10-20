@@ -21,6 +21,26 @@ sidecar only translates between gray's Responses wire and ACP.
 
 Auth methods: `cursor_login` (OAuth kind): the Cursor CLI holds the login, and the sidecar stores only a marker and account metadata. API key (`CURSOR_API_KEY`): the key is passed to the Cursor CLI, and the sidecar caches the key it was given in its own cache file (mode 0600).
 
+## Multiple accounts
+
+`cursor-sub account` pools several `cursor-agent` logins behind the one provider —
+mirroring `claude-sub`'s multi-account design. Each account is a labeled credential
+home; spawned `cursor-agent` children get it as a staged `$HOME` (with
+`XDG_CONFIG_HOME`/`CURSOR_DATA_DIR` pinned inside, and
+`AGENT_CLI_CREDENTIAL_STORE=file` on macOS so the global keychain can't leak).
+
+```
+gray cursor-sub account add <label>          # cursor-agent login into a new home
+gray cursor-sub account add --home <d> <l>   # adopt an existing home
+gray cursor-sub account list|use|remove|status
+```
+
+The pool lives in `$GRAY_HOME/cursor-sub/accounts.json`. Absent or empty `accounts`
+means today's single ambient login — zero-config back-compat. Per turn the first
+non-cooled account serves (`fill_first`, `least_used` via the `strategy` key, or a
+`use` pin); a 401/429 benches only that account (a `retry after`/`resets` hint wins),
+other failures never cool.
+
 ## Environment
 
 | Variable | Default | Meaning |

@@ -4,16 +4,19 @@ use acp_bridge::acp::{AcpClient, SpawnSpec};
 use acp_bridge::session::{Driver, PermissionDecision};
 use serde_json::{json, Value};
 
-pub struct CursorDriver;
+/// `env` stages the account's credential home (HOME/XDG/CURSOR_DATA_DIR
+/// pins); empty means the ambient login.
+pub struct CursorDriver {
+    pub env: Vec<(String, String)>,
+}
 
 impl Driver for CursorDriver {
     fn spawn_spec(&self, stage_dir: &std::path::Path) -> SpawnSpec {
         SpawnSpec {
-            command: crate::setup::resolve_command()
-                .unwrap_or_else(|| "cursor-agent".to_string()),
+            command: crate::setup::resolve_command().unwrap_or_else(|| "cursor-agent".to_string()),
             args: crate::setup::acp_argv(),
             cwd: stage_dir.to_path_buf(),
-            env: Vec::new(),
+            env: self.env.clone(),
         }
     }
 
