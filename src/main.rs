@@ -374,39 +374,73 @@ fn provider_chat(intents: &Intents, params: &Value) -> Result<Value, RpcError> {
         .get("auth_method")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    // Multi-account pick (accounts.json absent/empty → None → the ambient
-    // login, unchanged behavior). API-key turns carry no home.
-    let account = if method == AUTH_KEY {
-        None
+    // Fail fast before minting a relay. The multi-account probe is
+    // read-only (`serving`, not `pick`): the account that actually
+    // serves is chosen inside the turn so a mid-request failure can
+    // fail over. API-key turns carry no home.
+    let pooled = method != AUTH_KEY;
+    let probe = if pooled {
+        accounts::serving().map_err(unavailable)?
     } else {
-        accounts::pick().map_err(unavailable)?
+        None
     };
-    gate_auth(method, account.as_ref())?;
+    gate_auth(method, probe.as_ref())?;
     let model = params
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let (key, env) = match &account {
-        Some(p) => (
-            p.home.to_string_lossy().into_owned(),
-            accounts::home_env(&p.home),
-        ),
-        None => (String::new(), Vec::new()),
-    };
-    let pool = pool_for(&key, env);
-    let label = account.map(|p| p.label);
     let turn: TurnFn = Arc::new(move |raw: &[u8], cancel: &AtomicBool| {
-        let result = session::run_turn(&pool, raw, cancel);
-        // Account health rides the verdict: a served answer clears the
-        // slate, an account-scoped upstream failure (401/429) benches the
-        // account, request-scoped failures leave it alone.
-        if let Some(l) = &label {
-            match &result {
-                Ok(_) => accounts::note_success(l),
-                Err(e) => accounts::note_failure(l, e),
+        // Account failover, codex-sub style: pick → turn → on an
+        // account-scoped upstream verdict (401/429) bench that account
+        // and re-pick inside this same request; the relay buffers the
+        // whole SSE body before committing a response, so the failover
+        // is invisible to the host. Request-scoped failures (other
+        // 4xx, dead wires, malformed turns) never cool nor retry —
+        // they surface untouched. An empty/absent pool still gets the
+        // ambient login, one attempt, exactly as before.
+        let mut tried = std::collections::BTreeSet::new();
+        let mut last_err = String::new();
+        loop {
+            let account = match if pooled { accounts::pick() } else { Ok(None) } {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    let pool = pool_for("", Vec::new());
+                    return session::run_turn(&pool, raw, cancel);
+                }
+                Err(e) => {
+                    return Err(if last_err.is_empty() {
+                        e
+                    } else {
+                        format!("{e} · last error: {last_err}")
+                    });
+                }
+            };
+            if !tried.insert(account.label.clone()) {
+                // pick() never hands back a cooled label, so a repeat
+                // means the bench could not persist — bail rather than
+                // spin on one bad account.
+                return Err(format!(
+                    "cursor account {:?} failed again: {last_err}",
+                    account.label
+                ));
+            }
+            let key = account.home.to_string_lossy().into_owned();
+            let pool = pool_for(&key, accounts::home_env(&account.home));
+            match session::run_turn(&pool, raw, cancel) {
+                Ok(sse) => {
+                    // Account health rides the verdict: a served answer
+                    // clears the slate.
+                    accounts::note_success(&account.label);
+                    return Ok(sse);
+                }
+                Err(e) => {
+                    if !accounts::note_failure(&account.label, &e) {
+                        return Err(e);
+                    }
+                    last_err = e;
+                }
             }
         }
-        result
     });
     let (relay_url, relay_token) =
         relay::mint_turn(intents, model, turn, TOKEN_PREFIX).map_err(unavailable)?;

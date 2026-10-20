@@ -301,11 +301,13 @@ pub fn note_success(label: &str) {
 }
 
 /// The turn this account served failed with `detail`. Only account-
-/// scoped upstream verdicts cool it; anything else leaves the pool
-/// untouched.
-pub fn note_failure(label: &str, detail: &str) {
+/// scoped upstream verdicts cool it — and those are the only failures
+/// worth a same-request retry on a sibling. Returns `true` when the
+/// account was benched; `false` for request-scoped failures, which
+/// leave the pool untouched and must surface to the caller as-is.
+pub fn note_failure(label: &str, detail: &str) -> bool {
     let Some((code, msg)) = api_error(detail) else {
-        return;
+        return false;
     };
     let ttl = match code {
         401 => COOL_401,
@@ -313,9 +315,10 @@ pub fn note_failure(label: &str, detail: &str) {
             .map(|d| d.as_secs().min(MAX_RESET))
             .unwrap_or(COOL_429),
         // Request-scoped verdicts never cool an account.
-        _ => return,
+        _ => return false,
     };
     cool(label, ttl, detail);
+    true
 }
 
 fn cool(label: &str, ttl: u64, detail: &str) {
