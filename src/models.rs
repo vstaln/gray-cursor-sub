@@ -9,15 +9,16 @@ use std::time::Duration;
 use crate::driver::CursorDriver;
 
 /// Returns raw `[{value,name,configOptions?}]` or None if the probe fails.
-pub fn list_available() -> Option<Vec<Value>> {
+/// `env` stages the serving account's credential home (empty = ambient).
+pub fn list_available(env: &[(String, String)]) -> Option<Vec<Value>> {
     let bin = crate::setup::resolve_command()?;
     let spec = SpawnSpec {
         command: bin,
         args: crate::setup::acp_argv(),
         cwd: std::env::temp_dir(),
-        env: Vec::new(),
+        env: env.to_vec(),
     };
-    let driver = CursorDriver;
+    let driver = CursorDriver { env: env.to_vec() };
     let mut client = AcpClient::spawn(&spec).ok()?;
     let _ = client
         .initialize(driver.client_info(), driver.client_capabilities())
@@ -29,7 +30,11 @@ pub fn list_available() -> Option<Vec<Value>> {
         .session_new(&std::env::temp_dir().to_string_lossy(), json!([]))
         .ok()?;
     let res = client
-        .ext_call("cursor/list_available_models", json!({}), Duration::from_secs(15))
+        .ext_call(
+            "cursor/list_available_models",
+            json!({}),
+            Duration::from_secs(15),
+        )
         .or_else(|_| -> Result<Value, String> {
             // Some builds expose the list only via session/new.models.
             Ok(sess.get("models").cloned().unwrap_or_else(|| json!({})))
@@ -44,8 +49,8 @@ pub fn list_available() -> Option<Vec<Value>> {
 }
 
 /// catalog rows for provider/models: `{id, name}`.
-pub fn catalog() -> Vec<Value> {
-    list_available()
+pub fn catalog(env: &[(String, String)]) -> Vec<Value> {
+    list_available(env)
         .unwrap_or_default()
         .iter()
         .filter_map(|m| {

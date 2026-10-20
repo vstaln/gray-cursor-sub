@@ -5,16 +5,19 @@
 //! cursor.com dashboard session, not the CLI's credential. The card
 //! reports the real tier and no fabricated windows.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::setup;
 
-/// `provider/usage` entry: the `about` payload is the whole source.
+/// `provider/usage` entry: the `about` payload is the whole source,
+/// read under the serving account's credential home.
 pub fn handle(_params: &Value) -> Result<Value, String> {
-    let about = setup::about().ok_or_else(|| {
-        "cursor-agent not available or not logged in".to_string()
-    })?;
-    let email = about.get("userEmail").and_then(Value::as_str).unwrap_or_default();
+    let about = setup::about_env(&crate::accounts::serving_env())
+        .ok_or_else(|| "cursor-agent not available or not logged in".to_string())?;
+    let email = about
+        .get("userEmail")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if email.is_empty() {
         return Err("cursor-agent not logged in".to_string());
     }

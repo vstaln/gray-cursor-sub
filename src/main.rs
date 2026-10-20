@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cursor_sub::{driver::CursorDriver, models, usage, setup};
+use cursor_sub::{accounts, driver::CursorDriver, models, setup, usage};
 
 const PROVIDER_ID: &str = "cursor";
 const AUTH_CLI: &str = "cursor-login";
@@ -88,8 +88,17 @@ fn now_secs() -> u64 {
         .unwrap_or_default()
 }
 
+/// The login that would serve turns: the pooled account's staged home
+/// when configured, else the ambient `cursor-agent` login.
+fn login_info() -> Option<Value> {
+    setup::logged_in_env(&accounts::serving_env())
+}
+
 fn auth_start(ops: &Ops, params: &Value) -> Result<Value, RpcError> {
-    let method = params.get("auth_method").and_then(Value::as_str).unwrap_or_default();
+    let method = params
+        .get("auth_method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if method == AUTH_KEY {
         if setup::api_key().is_some() {
             return Ok(json!({
@@ -100,10 +109,12 @@ fn auth_start(ops: &Ops, params: &Value) -> Result<Value, RpcError> {
                 "retry_after_ms": 0,
             }));
         }
-        return Err(unavailable("set CURSOR_API_KEY first, or /connect with a pasted key"));
+        return Err(unavailable(
+            "set CURSOR_API_KEY first, or /connect with a pasted key",
+        ));
     }
     let bin = setup::resolve_command().ok_or_else(|| unavailable(setup::INSTALL_HINT))?;
-    if setup::logged_in().is_some() {
+    if login_info().is_some() {
         return Ok(json!({
             "operation_id": "",
             "status": "completed",
@@ -159,10 +170,13 @@ fn auth_start(ops: &Ops, params: &Value) -> Result<Value, RpcError> {
 }
 
 fn auth_poll(ops: &Ops, params: &Value) -> Result<Value, RpcError> {
-    let op_id = params.get("operation_id").and_then(Value::as_str).unwrap_or_default();
+    let op_id = params
+        .get("operation_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     // An immediate-complete op (empty id) just re-probes the CLI login.
     if op_id.is_empty() {
-        return Ok(match setup::logged_in() {
+        return Ok(match login_info() {
             Some(info) => json!({"state": "completed", "credential": login_material(&info)}),
             None => json!({"state": "failed", "error": {
                 "code": "unavailable", "message": setup::LOGIN_HINT,
@@ -183,7 +197,7 @@ fn auth_poll(ops: &Ops, params: &Value) -> Result<Value, RpcError> {
         let url = op.url.lock().ok().and_then(|u| u.clone());
         (done, url)
     };
-    if let Some(info) = setup::logged_in() {
+    if let Some(info) = login_info() {
         ops.lock().unwrap().remove(op_id);
         return Ok(json!({"state": "completed", "credential": login_material(&info)}));
     }
@@ -204,7 +218,10 @@ fn auth_poll(ops: &Ops, params: &Value) -> Result<Value, RpcError> {
 }
 
 fn auth_cancel(ops: &Ops, params: &Value) -> Result<Value, RpcError> {
-    let op_id = params.get("operation_id").and_then(Value::as_str).unwrap_or_default();
+    let op_id = params
+        .get("operation_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if let Some(mut op) = ops.lock().unwrap().remove(op_id) {
         if let Some(mut c) = op.child.take() {
             let _ = c.kill();
@@ -215,7 +232,10 @@ fn auth_cancel(ops: &Ops, params: &Value) -> Result<Value, RpcError> {
 }
 
 fn auth_refresh(params: &Value) -> Result<Value, RpcError> {
-    let method = params.get("auth_method").and_then(Value::as_str).unwrap_or_default();
+    let method = params
+        .get("auth_method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if method == AUTH_KEY {
         let key = setup::api_key()
             .ok_or_else(|| unavailable("CURSOR_API_KEY not set and no cached key"))?;
@@ -226,7 +246,7 @@ fn auth_refresh(params: &Value) -> Result<Value, RpcError> {
             "expires_at": null,
         }}));
     }
-    match setup::logged_in() {
+    match login_info() {
         Some(info) => Ok(json!({"credential": login_material(&info)})),
         None => Err(RpcError::Rpc {
             code: "invalid_grant",
@@ -236,11 +256,15 @@ fn auth_refresh(params: &Value) -> Result<Value, RpcError> {
 }
 
 fn auth_revoke(params: &Value) -> Result<Value, RpcError> {
-    let method = params.get("auth_method").and_then(Value::as_str).unwrap_or_default();
+    let method = params
+        .get("auth_method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if method == AUTH_CLI {
         if let Some(bin) = setup::resolve_command() {
             let _ = Command::new(bin)
                 .arg("logout")
+                .envs(accounts::serving_env())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -266,7 +290,7 @@ fn login_material(info: &Value) -> Value {
 
 // ---------- models + chat ----------
 
-fn gate_auth(method: &str) -> Result<(), RpcError> {
+fn gate_auth(method: &str, account: Option<&accounts::Pick>) -> Result<(), RpcError> {
     if setup::resolve_command().is_none() {
         return Err(unavailable(setup::INSTALL_HINT));
     }
@@ -277,8 +301,21 @@ fn gate_auth(method: &str) -> Result<(), RpcError> {
             }
         }
         _ => {
-            if setup::logged_in().is_none() {
-                return Err(unavailable(setup::LOGIN_HINT));
+            // A picked account proves its own home holds a login; the
+            // ambient verdict would hide a sibling account's gap.
+            let logged = match account {
+                Some(p) => setup::logged_in_env(&accounts::home_env(&p.home)).is_some(),
+                None => setup::logged_in().is_some(),
+            };
+            if !logged {
+                return Err(unavailable(match account {
+                    Some(p) => format!(
+                        "cursor account {:?} has no login in {}",
+                        p.label,
+                        p.home.display()
+                    ),
+                    None => setup::LOGIN_HINT.into(),
+                }));
             }
         }
     }
@@ -286,8 +323,11 @@ fn gate_auth(method: &str) -> Result<(), RpcError> {
 }
 
 fn provider_models(params: &Value) -> Result<Value, RpcError> {
-    let method = params.get("auth_method").and_then(Value::as_str).unwrap_or_default();
-    gate_auth(method)?;
+    let method = params
+        .get("auth_method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    gate_auth(method, None)?;
     // Stash a passed api_key so chat turns (credential-free) can reach it.
     if let Some(key) = params
         .get("credential")
@@ -298,7 +338,7 @@ fn provider_models(params: &Value) -> Result<Value, RpcError> {
     {
         let _ = setup::write_api_key_cache(key);
     }
-    let rows = models::catalog();
+    let rows = models::catalog(&accounts::serving_env());
     if rows.is_empty() {
         return Err(unavailable("cursor model discovery failed (CLI probe)"));
     }
@@ -309,24 +349,101 @@ fn provider_models(params: &Value) -> Result<Value, RpcError> {
     }))
 }
 
-fn provider_chat(
-    intents: &Intents,
-    pool: &Arc<Pool>,
-    params: &Value,
-) -> Result<Value, RpcError> {
-    let provider = params.get("provider").and_then(Value::as_str).unwrap_or_default();
+/// One pooled ACP session-pool per credential home (key `""` = ambient).
+fn pool_for(key: &str, env: Vec<(String, String)>) -> Arc<Pool> {
+    static POOLS: std::sync::OnceLock<Mutex<HashMap<String, Arc<Pool>>>> =
+        std::sync::OnceLock::new();
+    let pools = POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    pools
+        .lock()
+        .unwrap()
+        .entry(key.to_string())
+        .or_insert_with(|| Pool::new(Arc::new(CursorDriver { env })))
+        .clone()
+}
+
+fn provider_chat(intents: &Intents, params: &Value) -> Result<Value, RpcError> {
+    let provider = params
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if provider != PROVIDER_ID {
         return Err(RpcError::Protocol("unknown provider".into()));
     }
-    let method = params.get("auth_method").and_then(Value::as_str).unwrap_or_default();
-    gate_auth(method)?;
-    let model = params.get("model").and_then(Value::as_str).unwrap_or_default();
-    let pool2 = pool.clone();
+    let method = params
+        .get("auth_method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    // Fail fast before minting a relay. The multi-account probe is
+    // read-only (`serving`, not `pick`): the account that actually
+    // serves is chosen inside the turn so a mid-request failure can
+    // fail over. API-key turns carry no home.
+    let pooled = method != AUTH_KEY;
+    let probe = if pooled {
+        accounts::serving().map_err(unavailable)?
+    } else {
+        None
+    };
+    gate_auth(method, probe.as_ref())?;
+    let model = params
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let turn: TurnFn = Arc::new(move |raw: &[u8], cancel: &AtomicBool| {
-        session::run_turn(&pool2, raw, cancel)
+        // Account failover, codex-sub style: pick → turn → on an
+        // account-scoped upstream verdict (401/429) bench that account
+        // and re-pick inside this same request; the relay buffers the
+        // whole SSE body before committing a response, so the failover
+        // is invisible to the host. Request-scoped failures (other
+        // 4xx, dead wires, malformed turns) never cool nor retry —
+        // they surface untouched. An empty/absent pool still gets the
+        // ambient login, one attempt, exactly as before.
+        let mut tried = std::collections::BTreeSet::new();
+        let mut last_err = String::new();
+        loop {
+            let account = match if pooled { accounts::pick() } else { Ok(None) } {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    let pool = pool_for("", Vec::new());
+                    return session::run_turn(&pool, raw, cancel);
+                }
+                Err(e) => {
+                    return Err(if last_err.is_empty() {
+                        e
+                    } else {
+                        format!("{e} · last error: {last_err}")
+                    });
+                }
+            };
+            if !tried.insert(account.label.clone()) {
+                // pick() never hands back a cooled label, so a repeat
+                // means the bench could not persist — bail rather than
+                // spin on one bad account.
+                return Err(format!(
+                    "cursor account {:?} failed again: {last_err}",
+                    account.label
+                ));
+            }
+            let key = account.home.to_string_lossy().into_owned();
+            let pool = pool_for(&key, accounts::home_env(&account.home));
+            match session::run_turn(&pool, raw, cancel) {
+                Ok(sse) => {
+                    // Account health rides the verdict: a served answer
+                    // clears the slate.
+                    accounts::note_success(&account.label);
+                    return Ok(sse);
+                }
+                Err(e) => {
+                    if !accounts::note_failure(&account.label, &e) {
+                        return Err(e);
+                    }
+                    last_err = e;
+                }
+            }
+        }
     });
-    let (relay_url, relay_token) = relay::mint_turn(intents, model, turn, TOKEN_PREFIX)
-        .map_err(unavailable)?;
+    let (relay_url, relay_token) =
+        relay::mint_turn(intents, model, turn, TOKEN_PREFIX).map_err(unavailable)?;
     Ok(json!({
         "relay_url": relay_url,
         "relay_token": relay_token,
@@ -334,45 +451,61 @@ fn provider_chat(
 }
 
 fn command_run(params: &Value) -> Result<Value, RpcError> {
-    let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if name != "/cursor" {
         return Err(RpcError::Protocol(format!("unknown command {name}")));
     }
     let argv: Vec<String> = params
         .get("argv")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     match argv.first().map(String::as_str).unwrap_or("") {
         "" => Ok(json!({})), // bare /cursor → provider-login shortcut
         "status" => {
-            let text = match setup::logged_in() {
+            let mut text = match login_info() {
                 Some(info) => format!(
                     "Cursor CLI: logged in as {} ({}, cli {})",
                     info.get("email").and_then(Value::as_str).unwrap_or("?"),
-                    info.get("subscriptionTier").and_then(Value::as_str).unwrap_or("?"),
-                    info.get("cliVersion").and_then(Value::as_str).unwrap_or("?"),
+                    info.get("subscriptionTier")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?"),
+                    info.get("cliVersion")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?"),
                 ),
                 None => match setup::about() {
-                    Some(_) => "Cursor CLI present but not logged in — run `cursor-agent login`".into(),
+                    Some(_) => {
+                        "Cursor CLI present but not logged in — run `cursor-agent login`".into()
+                    }
                     None => setup::INSTALL_HINT.into(),
                 },
             };
+            let suffix = accounts::status_suffix();
+            if !suffix.is_empty() {
+                text.push_str(&format!("\n{suffix}"));
+            }
             Ok(json!({"text": text}))
         }
-        _ => Err(RpcError::Protocol("usage: /cursor [status]".into())),
+        "account" => Ok(json!({
+            "text": accounts::command(&argv[1..], false).unwrap_or_else(|e| e),
+        })),
+        _ => Err(RpcError::Protocol(
+            "usage: /cursor [status|account …]".into(),
+        )),
     }
 }
 
 // ---------- sidecar loop ----------
 
-fn dispatch(
-    method: &str,
-    params: &Value,
-    ops: &Ops,
-    intents: &Intents,
-    pool: &Arc<Pool>,
-) -> Result<Value, RpcError> {
+fn dispatch(method: &str, params: &Value, ops: &Ops, intents: &Intents) -> Result<Value, RpcError> {
     match method {
         "plugin/manifest" => Ok(manifest()),
         "provider/auth/start" => auth_start(ops, params),
@@ -380,9 +513,9 @@ fn dispatch(
         "provider/auth/cancel" => auth_cancel(ops, params),
         "provider/auth/refresh" => auth_refresh(params),
         "provider/auth/revoke" => auth_revoke(params),
-        "provider/usage" => usage::handle(&params).map_err(unavailable),
+        "provider/usage" => usage::handle(params).map_err(unavailable),
         "provider/models" => provider_models(params),
-        "provider/chat" => provider_chat(intents, pool, params),
+        "provider/chat" => provider_chat(intents, params),
         "command/run" => command_run(params),
         "plugin/tools" => Ok(json!({"tools": []})),
         "event/notify" | "plugin/shutdown" => Ok(json!({})),
@@ -401,13 +534,34 @@ fn write_response(out: &mut impl Write, id: Value, outcome: Result<Value, RpcErr
 }
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("manifest") {
-        println!("{}", manifest());
-        return;
+    match std::env::args().nth(1).as_deref() {
+        Some("manifest") => {
+            println!("{}", manifest());
+            return;
+        }
+        // `gray cursor-sub account …`: the multi-account pool — `add`
+        // drives the real `cursor-agent login` into a fresh credential
+        // home, so it needs this terminal, not the sidecar's NDJSON pipe.
+        Some("account") => {
+            let args: Vec<String> = std::env::args_os()
+                .skip(2)
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            match accounts::command(&args, true) {
+                Ok(text) => {
+                    println!("{text}");
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        _ => {}
     }
     let ops: Ops = Arc::new(Mutex::new(HashMap::new()));
     let intents: Intents = Default::default();
-    let pool: Arc<Pool> = Pool::new(Arc::new(CursorDriver));
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -421,9 +575,13 @@ fn main() {
             continue;
         };
         let id = req.get("id").cloned().unwrap_or(Value::Null);
-        let method = req.get("method").and_then(Value::as_str).unwrap_or_default().to_string();
+        let method = req
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-        let result = dispatch(&method, &params, &ops, &intents, &pool);
+        let result = dispatch(&method, &params, &ops, &intents);
         if !id.is_null() && !write_response(&mut out, id, result) {
             return;
         }

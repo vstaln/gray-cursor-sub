@@ -23,11 +23,13 @@ pub fn resolve_command() -> Option<String> {
 }
 
 /// The `about` payload: {cliVersion, userEmail, subscriptionTier, ...}.
-/// userEmail == null means unauthenticated.
-pub fn about() -> Option<Value> {
+/// userEmail == null means unauthenticated. `env` stages a credential
+/// home (see [`crate::accounts::home_env`]); empty probes the ambient CLI.
+pub fn about_env(env: &[(String, String)]) -> Option<Value> {
     let bin = resolve_command()?;
     let out = Command::new(&bin)
         .args(["about", "--format", "json"])
+        .envs(env.iter().cloned())
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -38,15 +40,29 @@ pub fn about() -> Option<Value> {
     serde_json::from_slice::<Value>(&out.stdout).ok()
 }
 
-/// Some(json) when logged in — metadata fields for the credential.
-pub fn logged_in() -> Option<Value> {
-    let about = about()?;
+/// Ambient [`about_env`] — no staged home.
+pub fn about() -> Option<Value> {
+    about_env(&[])
+}
+
+/// Some(json) when the given credential home is logged in — metadata
+/// fields for the credential.
+pub fn logged_in_env(env: &[(String, String)]) -> Option<Value> {
+    let about = about_env(env)?;
     let email = about.get("userEmail").and_then(Value::as_str)?;
+    if email.is_empty() {
+        return None;
+    }
     Some(json!({
         "email": email,
         "cliVersion": about.get("cliVersion").and_then(Value::as_str).unwrap_or(""),
         "subscriptionTier": about.get("subscriptionTier").and_then(Value::as_str).unwrap_or(""),
     }))
+}
+
+/// Ambient [`logged_in_env`] — no staged home.
+pub fn logged_in() -> Option<Value> {
+    logged_in_env(&[])
 }
 
 /// API key resolution order: explicit flag env > gray-managed cache > env.

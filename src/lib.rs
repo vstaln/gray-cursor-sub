@@ -1,3 +1,4 @@
+pub mod accounts;
 pub mod driver;
 pub mod models;
 pub mod setup;
