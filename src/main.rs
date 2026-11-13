@@ -43,6 +43,7 @@ fn manifest() -> Value {
             },
         }],
         "commands": ["/cursor"],
+        "command_descriptions": {"/cursor": "switch to Cursor models"},
     })
 }
 
