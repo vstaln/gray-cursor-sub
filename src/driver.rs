@@ -102,23 +102,31 @@ impl Driver for CursorDriver {
         effort: Option<&str>,
         overrides: &[(String, String)],
     ) -> Result<(), String> {
-        if let Err(e) = client.set_model(session_id, model, Value::Null) {
-            if e.contains("-32601") || e.contains("not found") || e.contains("Invalid") {
+        if let Err(f) = client.set_model_failure(session_id, model, Value::Null) {
+            let unknown = match f.code {
+                Some(code) => code == -32601 || code == -32602,
+                None => f.message.contains("not found") || f.message.contains("Invalid"),
+            };
+            if unknown {
                 return Err(format!("unknown cursor model `{model}`"));
             }
-            return Err(format!("cursor set_model: {e}"));
+            return Err(format!("cursor set_model: {}", f.message));
         }
         // config option ids by key: context, effort/reasoning, fast, thinking.
         for (key, value) in overrides {
             let Some(option_id) = find_config_option(session_new_result, key) else {
                 continue;
             };
-            let _ = client.set_config_option(session_id, &option_id, json!(value));
+            client
+                .set_config_option(session_id, &option_id, json!(value))
+                .map_err(|e| format!("cursor rejected {option_id}={value}: {e}"))?;
         }
         if let Some(e) = effort {
             if !overrides.iter().any(|(k, _)| k == "effort") {
                 if let Some(option_id) = find_config_option(session_new_result, "effort") {
-                    let _ = client.set_config_option(session_id, &option_id, json!(e));
+                    client
+                        .set_config_option(session_id, &option_id, json!(e))
+                        .map_err(|err| format!("cursor rejected {option_id}={e}: {err}"))?;
                 }
             }
         }
