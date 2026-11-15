@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "gray-cursor-sub"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "gray-acp-bridge",
  "serde",
