@@ -1,8 +1,8 @@
 //! cursor-sub — Gray sidecar that relays chat turns to the Cursor CLI's
 //! `cursor-agent acp` subprocess (t3code CursorDriver parity, model role).
 
-use acp_bridge::relay::{self, Intents, TurnFn};
-use acp_bridge::session::{self, Pool};
+use gray_acp::relay::{self, Intents, TurnFn};
+use gray_acp::session::{self, Pool};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};

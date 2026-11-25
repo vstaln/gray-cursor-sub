@@ -1,8 +1,8 @@
 //! Model catalog: probe a throwaway cursor-agent ACP child for
 //! `cursor/list_available_models` (needs no prompt — extension method).
 
-use acp_bridge::acp::{AcpClient, SpawnSpec};
-use acp_bridge::session::Driver;
+use gray_acp::acp::{AcpClient, SpawnSpec};
+use gray_acp::session::Driver;
 use serde_json::{json, Value};
 use std::time::Duration;
 

@@ -84,8 +84,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "gray-acp-bridge"
-version = "0.1.0"
+name = "gray-acp"
+version = "0.2.32"
+source = "git+https://github.com/vstaln/gray.git#a20acad6ce143b78005fb4678d3fded83d92a780"
 dependencies = [
  "anyhow",
  "serde",
@@ -98,7 +99,7 @@ dependencies = [
 name = "gray-cursor-sub"
 version = "0.1.2"
 dependencies = [
- "gray-acp-bridge",
+ "gray-acp",
  "serde",
  "serde_json",
  "tempfile",
