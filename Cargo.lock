@@ -86,7 +86,7 @@ dependencies = [
 [[package]]
 name = "gray-acp"
 version = "0.2.33"
-source = "git+https://github.com/vstaln/gray.git#01e94e5a738c05451d990c0e4395383c610cdd84"
+source = "git+https://github.com/vstaln/gray.git#06536fcd3a4a1d711ae002337401a47607560ee2"
 dependencies = [
  "anyhow",
  "libc",
