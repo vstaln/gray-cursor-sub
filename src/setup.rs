@@ -29,6 +29,7 @@ pub fn about_env(env: &[(String, String)]) -> Option<Value> {
     let bin = resolve_command()?;
     let out = Command::new(&bin)
         .args(["about", "--format", "json"])
+        .env_remove(API_KEY_ENV)
         .envs(env.iter().cloned())
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -94,17 +95,21 @@ pub fn write_api_key_cache(key: &str) -> std::io::Result<()> {
     let Some(path) = cache_path() else {
         return Ok(());
     };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.create(true).truncate(true).write(true).mode(0o600);
-        let mut f = opts.open(path)?;
-        use std::io::Write;
-        f.write_all(format!("{}\n", json!({"api_key": key})).as_bytes())
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    use std::io::Write;
+    writeln!(file, "{}", json!({"api_key": key}))?;
+    file.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+pub fn remove_api_key_cache() {
+    if let Some(path) = cache_path() {
+        let _ = std::fs::remove_file(path);
     }
-    #[cfg(not(unix))]
-    std::fs::write(path, format!("{}\n", json!({"api_key": key})))
 }
 
 pub fn read_api_key_cache() -> Option<String> {
@@ -118,19 +123,21 @@ pub fn read_api_key_cache() -> Option<String> {
     }
 }
 
-/// Spawn argv for the ACP child (endpoint + api-key injection).
+pub fn cli_env(mut env: Vec<(String, String)>, key: Option<&str>) -> Vec<(String, String)> {
+    env.push((API_KEY_ENV.into(), key.unwrap_or_default().into()));
+    env
+}
+
+pub fn endpoint() -> Option<String> {
+    let endpoint = std::env::var(ENDPOINT_ENV).ok()?.trim().to_owned();
+    (!endpoint.is_empty()).then_some(endpoint)
+}
+
 pub fn acp_argv() -> Vec<String> {
     let mut args = Vec::new();
-    if let Ok(endpoint) = std::env::var(ENDPOINT_ENV) {
-        let endpoint = endpoint.trim();
-        if !endpoint.is_empty() {
-            args.push("-e".into());
-            args.push(endpoint.into());
-        }
-    }
-    if let Some(key) = api_key() {
-        args.push("--api-key".into());
-        args.push(key);
+    if let Some(endpoint) = endpoint() {
+        args.push("-e".into());
+        args.push(endpoint);
     }
     if let Ok(mode) = std::env::var("GRAY_CURSOR_SUB_PERMISSION") {
         match mode.trim() {

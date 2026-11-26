@@ -1,6 +1,3 @@
-//! cursor-sub — Gray sidecar that relays chat turns to the Cursor CLI's
-//! `cursor-agent acp` subprocess (t3code CursorDriver parity, model role).
-
 use gray_acp::relay::{self, Intents, TurnFn};
 use gray_acp::session::{self, Pool};
 use serde_json::{json, Value};
@@ -8,10 +5,10 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cursor_sub::{accounts, driver::CursorDriver, models, setup, usage};
+use cursor_sub::{accounts, driver::CursorDriver, models, sdk, setup, usage};
 
 const PROVIDER_ID: &str = "cursor";
 const AUTH_CLI: &str = "cursor-login";
@@ -27,7 +24,7 @@ fn manifest() -> Value {
         "capabilities": ["provider.credentials", "host.say"],
         "providers": [{
             "id": PROVIDER_ID,
-            "name": "Cursor CLI (subscription)",
+            "name": "Cursor",
             "auth_methods": [
                 {"id": AUTH_CLI, "kind": "oauth",
                  "name": "Cursor CLI login",
@@ -271,8 +268,8 @@ fn auth_revoke(params: &Value) -> Result<Value, RpcError> {
                 .stderr(Stdio::null())
                 .status();
         }
-    } else if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-        let _ = std::fs::remove_file(std::path::Path::new(&home).join(".cursor-sub.json"));
+    } else {
+        setup::remove_api_key_cache();
     }
     Ok(json!({}))
 }
@@ -291,36 +288,46 @@ fn login_material(info: &Value) -> Value {
 
 // ---------- models + chat ----------
 
-fn gate_auth(method: &str, account: Option<&accounts::Pick>) -> Result<(), RpcError> {
+enum ApiTransport {
+    Sdk(&'static std::path::Path),
+    Cli,
+}
+
+fn api_transport() -> Result<ApiTransport, RpcError> {
+    if setup::endpoint().is_some() {
+        return setup::resolve_command()
+            .map(|_| ApiTransport::Cli)
+            .ok_or_else(|| unavailable("CURSOR_API_ENDPOINT requires the Cursor CLI"));
+    }
+    match sdk::runtime() {
+        Ok(root) => Ok(ApiTransport::Sdk(root)),
+        Err(_)
+            if std::env::var_os("GRAY_CURSOR_SUB_SDK_ROOT").is_none()
+                && setup::resolve_command().is_some() =>
+        {
+            Ok(ApiTransport::Cli)
+        }
+        Err(error) => Err(unavailable(format!(
+            "{error}; install the Cursor SDK runtime or Cursor CLI"
+        ))),
+    }
+}
+
+fn gate_cli_auth(account: Option<&accounts::Pick>) -> Result<(), RpcError> {
     if setup::resolve_command().is_none() {
         return Err(unavailable(setup::INSTALL_HINT));
     }
-    match method {
-        AUTH_KEY => {
-            if setup::api_key().is_none() {
-                return Err(unavailable("set CURSOR_API_KEY for this auth method"));
-            }
+    match account {
+        Some(p) if setup::logged_in_env(&accounts::home_env(&p.home)).is_none() => {
+            Err(unavailable(format!(
+                "cursor account {:?} has no login in {}",
+                p.label,
+                p.home.display()
+            )))
         }
-        _ => {
-            // A picked account proves its own home holds a login; the
-            // ambient verdict would hide a sibling account's gap.
-            let logged = match account {
-                Some(p) => setup::logged_in_env(&accounts::home_env(&p.home)).is_some(),
-                None => setup::logged_in().is_some(),
-            };
-            if !logged {
-                return Err(unavailable(match account {
-                    Some(p) => format!(
-                        "cursor account {:?} has no login in {}",
-                        p.label,
-                        p.home.display()
-                    ),
-                    None => setup::LOGIN_HINT.into(),
-                }));
-            }
-        }
+        None if setup::logged_in().is_none() => Err(unavailable(setup::LOGIN_HINT)),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 fn provider_models(params: &Value) -> Result<Value, RpcError> {
@@ -328,20 +335,35 @@ fn provider_models(params: &Value) -> Result<Value, RpcError> {
         .get("auth_method")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    gate_auth(method, None)?;
-    // Stash a passed api_key so chat turns (credential-free) can reach it.
-    if let Some(key) = params
-        .get("credential")
-        .and_then(|c| c.get("material"))
-        .and_then(|m| m.get("secrets"))
-        .and_then(|s| s.get("api_key"))
-        .and_then(Value::as_str)
-    {
-        let _ = setup::write_api_key_cache(key);
-    }
-    let rows = models::catalog(&accounts::serving_env());
+    let rows = if method == AUTH_KEY {
+        let pasted = params
+            .pointer("/credential/material/secrets/api_key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+        let key = pasted
+            .map(str::to_owned)
+            .or_else(setup::api_key)
+            .ok_or_else(|| unavailable("set CURSOR_API_KEY for this auth method"))?;
+        let rows = match api_transport()? {
+            ApiTransport::Sdk(root) => sdk::catalog(root, &key).map_err(unavailable)?,
+            ApiTransport::Cli => models::catalog(&setup::cli_env(Vec::new(), Some(&key))),
+        };
+        if pasted.is_some() && !rows.is_empty() {
+            setup::write_api_key_cache(&key)
+                .map_err(|e| unavailable(format!("Cursor API key cache: {e}")))?;
+        }
+        rows
+    } else {
+        let account = accounts::serving().map_err(unavailable)?;
+        gate_cli_auth(account.as_ref())?;
+        let env = account
+            .map(|p| accounts::home_env(&p.home))
+            .unwrap_or_default();
+        models::catalog(&setup::cli_env(env, None))
+    };
     if rows.is_empty() {
-        return Err(unavailable("cursor model discovery failed (CLI probe)"));
+        return Err(unavailable("Cursor model discovery returned no models"));
     }
     Ok(json!({
         "provider": PROVIDER_ID,
@@ -352,8 +374,7 @@ fn provider_models(params: &Value) -> Result<Value, RpcError> {
 
 /// One pooled ACP session-pool per credential home (key `""` = ambient).
 fn pool_for(key: &str, env: Vec<(String, String)>) -> Arc<Pool> {
-    static POOLS: std::sync::OnceLock<Mutex<HashMap<String, Arc<Pool>>>> =
-        std::sync::OnceLock::new();
+    static POOLS: OnceLock<Mutex<HashMap<String, Arc<Pool>>>> = OnceLock::new();
     let pools = POOLS.get_or_init(|| Mutex::new(HashMap::new()));
     pools
         .lock()
@@ -363,7 +384,28 @@ fn pool_for(key: &str, env: Vec<(String, String)>) -> Arc<Pool> {
         .clone()
 }
 
-fn provider_chat(intents: &Intents, params: &Value) -> Result<Value, RpcError> {
+fn cli_key_pool_for(key: &str) -> Arc<Pool> {
+    static POOL: OnceLock<Mutex<(String, Arc<Pool>)>> = OnceLock::new();
+    let new_pool = || {
+        Pool::new(Arc::new(CursorDriver {
+            env: setup::cli_env(Vec::new(), Some(key)),
+        }))
+    };
+    let mut state = POOL
+        .get_or_init(|| Mutex::new((key.to_owned(), new_pool())))
+        .lock()
+        .unwrap();
+    if state.0 != key {
+        *state = (key.to_owned(), new_pool());
+    }
+    Arc::clone(&state.1)
+}
+
+fn provider_chat(
+    sdk_pool: &Arc<sdk::Pool>,
+    intents: &Intents,
+    params: &Value,
+) -> Result<Value, RpcError> {
     let provider = params
         .get("provider")
         .and_then(Value::as_str)
@@ -371,84 +413,83 @@ fn provider_chat(intents: &Intents, params: &Value) -> Result<Value, RpcError> {
     if provider != PROVIDER_ID {
         return Err(RpcError::Protocol("unknown provider".into()));
     }
-    let method = params
-        .get("auth_method")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    // Fail fast before minting a relay. The multi-account probe is
-    // read-only (`serving`, not `pick`): the account that actually
-    // serves is chosen inside the turn so a mid-request failure can
-    // fail over. API-key turns carry no home.
-    let pooled = method != AUTH_KEY;
-    let probe = if pooled {
-        accounts::serving().map_err(unavailable)?
-    } else {
-        None
-    };
-    gate_auth(method, probe.as_ref())?;
     let model = params
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let turn: TurnFn = Arc::new(move |raw: &[u8], cancel: &AtomicBool| {
-        // Account failover, codex-sub style: pick → turn → on an
-        // account-scoped upstream verdict (401/429) bench that account
-        // and re-pick inside this same request; the relay buffers the
-        // whole SSE body before committing a response, so the failover
-        // is invisible to the host. Request-scoped failures (other
-        // 4xx, dead wires, malformed turns) never cool nor retry —
-        // they surface untouched. An empty/absent pool still gets the
-        // ambient login, one attempt, exactly as before.
-        let mut tried = std::collections::BTreeSet::new();
-        let mut last_err = String::new();
-        loop {
-            let account = match if pooled { accounts::pick() } else { Ok(None) } {
-                Ok(Some(p)) => p,
-                Ok(None) => {
-                    let pool = pool_for("", Vec::new());
-                    return session::run_turn(&pool, raw, cancel);
-                }
-                Err(e) => {
-                    return Err(if last_err.is_empty() {
-                        e
-                    } else {
-                        format!("{e} · last error: {last_err}")
-                    });
-                }
-            };
-            if !tried.insert(account.label.clone()) {
-                // pick() never hands back a cooled label, so a repeat
-                // means the bench could not persist — bail rather than
-                // spin on one bad account.
-                return Err(format!(
-                    "cursor account {:?} failed again: {last_err}",
-                    account.label
-                ));
+    let turn: TurnFn = if params.get("auth_method").and_then(Value::as_str) == Some(AUTH_KEY) {
+        let key = setup::api_key()
+            .ok_or_else(|| unavailable("set CURSOR_API_KEY for this auth method"))?;
+        match api_transport()? {
+            ApiTransport::Sdk(root) => {
+                let pool = Arc::clone(sdk_pool);
+                let model = model.to_owned();
+                Arc::new(move |raw, cancel| pool.run(root, &key, &model, raw, cancel))
             }
-            let key = account.home.to_string_lossy().into_owned();
-            let pool = pool_for(&key, accounts::home_env(&account.home));
-            match session::run_turn(&pool, raw, cancel) {
-                Ok(sse) => {
-                    // Account health rides the verdict: a served answer
-                    // clears the slate.
-                    accounts::note_success(&account.label);
-                    return Ok(sse);
-                }
-                Err(e) => {
-                    if !accounts::note_failure(&account.label, &e) {
-                        return Err(e);
-                    }
-                    last_err = e;
-                }
+            ApiTransport::Cli => {
+                let pool = cli_key_pool_for(&key);
+                Arc::new(move |raw, cancel| session::run_turn(&pool, raw, cancel))
             }
         }
-    });
+    } else {
+        gate_cli_auth(accounts::serving().map_err(unavailable)?.as_ref())?;
+        Arc::new(cli_subscription_turn)
+    };
     let (relay_url, relay_token) =
         relay::mint_turn(intents, model, turn, TOKEN_PREFIX).map_err(unavailable)?;
     Ok(json!({
         "relay_url": relay_url,
         "relay_token": relay_token,
     }))
+}
+
+fn cli_subscription_turn(raw: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, String> {
+    let mut tried = std::collections::BTreeSet::new();
+    let mut last_err = String::new();
+    loop {
+        let account = match accounts::pick() {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                let pool = pool_for("", setup::cli_env(Vec::new(), None));
+                return session::run_turn(&pool, raw, cancel);
+            }
+            Err(e) => {
+                return Err(if last_err.is_empty() {
+                    e
+                } else {
+                    format!("{e} · last error: {last_err}")
+                });
+            }
+        };
+        if !tried.insert(account.label.clone()) {
+            // pick() never hands back a cooled label, so a repeat
+            // means the bench could not persist — bail rather than
+            // spin on one bad account.
+            return Err(format!(
+                "cursor account {:?} failed again: {last_err}",
+                account.label
+            ));
+        }
+        let key = account.home.to_string_lossy().into_owned();
+        let pool = pool_for(
+            &key,
+            setup::cli_env(accounts::home_env(&account.home), None),
+        );
+        match session::run_turn(&pool, raw, cancel) {
+            Ok(sse) => {
+                // Account health rides the verdict: a served answer
+                // clears the slate.
+                accounts::note_success(&account.label);
+                return Ok(sse);
+            }
+            Err(e) => {
+                if !accounts::note_failure(&account.label, &e) {
+                    return Err(e);
+                }
+                last_err = e;
+            }
+        }
+    }
 }
 
 fn command_run(params: &Value) -> Result<Value, RpcError> {
@@ -489,6 +530,16 @@ fn command_run(params: &Value) -> Result<Value, RpcError> {
                     None => setup::INSTALL_HINT.into(),
                 },
             };
+            if setup::api_key().is_some() {
+                let transport: &str = match api_transport() {
+                    Ok(ApiTransport::Sdk(_)) => "Cursor SDK ready (API-key auth configured)",
+                    Ok(ApiTransport::Cli) => {
+                        "Cursor API-key auth using CLI compatibility transport"
+                    }
+                    Err(_) => "Cursor API key configured; install the SDK runtime or Cursor CLI",
+                };
+                text.push_str(&format!("\n{transport}"));
+            }
             let suffix = accounts::status_suffix();
             if !suffix.is_empty() {
                 text.push_str(&format!("\n{suffix}"));
@@ -506,7 +557,13 @@ fn command_run(params: &Value) -> Result<Value, RpcError> {
 
 // ---------- sidecar loop ----------
 
-fn dispatch(method: &str, params: &Value, ops: &Ops, intents: &Intents) -> Result<Value, RpcError> {
+fn dispatch(
+    method: &str,
+    params: &Value,
+    ops: &Ops,
+    intents: &Intents,
+    sdk_pool: &Arc<sdk::Pool>,
+) -> Result<Value, RpcError> {
     match method {
         "plugin/manifest" => Ok(manifest()),
         "provider/auth/start" => auth_start(ops, params),
@@ -516,7 +573,7 @@ fn dispatch(method: &str, params: &Value, ops: &Ops, intents: &Intents) -> Resul
         "provider/auth/revoke" => auth_revoke(params),
         "provider/usage" => usage::handle(params).map_err(unavailable),
         "provider/models" => provider_models(params),
-        "provider/chat" => provider_chat(intents, params),
+        "provider/chat" => provider_chat(sdk_pool, intents, params),
         "command/run" => command_run(params),
         "plugin/tools" => Ok(json!({"tools": []})),
         "event/notify" | "plugin/shutdown" => Ok(json!({})),
@@ -548,7 +605,7 @@ fn main() {
                 .skip(2)
                 .map(|s| s.to_string_lossy().into_owned())
                 .collect();
-            match accounts::command(&args, true) {
+            match accounts::command(&args, std::io::IsTerminal::is_terminal(&std::io::stdin())) {
                 Ok(text) => {
                     println!("{text}");
                     return;
@@ -563,6 +620,7 @@ fn main() {
     }
     let ops: Ops = Arc::new(Mutex::new(HashMap::new()));
     let intents: Intents = Default::default();
+    let sdk_pool = Arc::new(sdk::Pool::default());
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -582,12 +640,13 @@ fn main() {
             .unwrap_or_default()
             .to_string();
         let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-        let result = dispatch(&method, &params, &ops, &intents);
+        let result = dispatch(&method, &params, &ops, &intents, &sdk_pool);
         if !id.is_null() && !write_response(&mut out, id, result) {
-            return;
+            break;
         }
         if method == "plugin/shutdown" {
             break;
         }
     }
+    sdk_pool.close();
 }

@@ -1,0 +1,10 @@
+{
+  "name": "gray-cursor-sub-sdk-runtime",
+  "private": true,
+  "dependencies": {
+    "@cursor/sdk": "1.5.0"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}
