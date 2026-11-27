@@ -85,10 +85,11 @@ dependencies = [
 
 [[package]]
 name = "gray-acp"
-version = "0.2.32"
-source = "git+https://github.com/vstaln/gray.git#a20acad6ce143b78005fb4678d3fded83d92a780"
+version = "0.2.33"
+source = "git+https://github.com/vstaln/gray.git#06536fcd3a4a1d711ae002337401a47607560ee2"
 dependencies = [
  "anyhow",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
